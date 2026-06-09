@@ -1,0 +1,277 @@
+name: Build & Release (Windows EXE)
+
+# 触发方式：
+#   1) 推送 tag（推荐）：git tag v1.0.7 && git push origin v1.0.7
+#   2) 手动触发：Actions 页面点击 "Run workflow"
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      skip_frontend:
+        description: '跳过前端构建（复用已提交的 frontend/dist，一般保持 false）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # 创建 Release / 上传产物需要写权限
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10.11'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # ---------- 安装 Python 依赖（三个子服务 + launcher + Nuitka include 列表的并集）----------
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install \
+            "nuitka" "ordered-set" "zstandard" \
+            "fastapi>=0.104.0" "uvicorn[standard]>=0.24.0" \
+            "sqlalchemy>=2.0.0" "asyncmy>=0.2.9" "pymysql>=1.1.0" \
+            "pydantic>=2.5.0" "pydantic-settings>=2.1.0" "email-validator>=2.1.0" \
+            "aiohttp>=3.9.0" "aiohttp-socks>=0.8.0" \
+            "python-multipart>=0.0.6" "python-jose[cryptography]>=3.3.0" \
+            "passlib[bcrypt]>=1.7.4" "bcrypt>=4.0.0" \
+            "playwright>=1.40.0" "loguru>=0.7.2" \
+            "httpx>=0.25.0" "httpcore>=1.0.0" "h11>=0.14.0" \
+            "redis>=5.0.0" "pycryptodome>=3.19.0" "requests>=2.31.0" \
+            "python-dateutil>=2.8.0" "pandas>=2.0.0" "openpyxl>=3.1.0" \
+            "anyio>=4.0.0" "sniffio>=1.3.0" "click>=8.1.0" \
+            "idna>=3.6" "certifi>=2023.11.0" \
+            "qrcode[pil]>=7.4.0" "Pillow>=10.0.0" \
+            "websockets==12.0" "python-socks[asyncio]>=2.0.0" \
+            "openai>=1.0.0" "apscheduler>=3.10.0"
+
+      # ---------- [2/6] 前端构建 ----------
+      - name: Build frontend
+        if: ${{ inputs.skip_frontend != true }}
+        shell: bash
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          test -f dist/index.html || (echo "[ERROR] 前端构建产物缺失" && exit 1)
+
+      - name: Verify frontend dist exists (when skipped)
+        if: ${{ inputs.skip_frontend == true }}
+        shell: bash
+        run: test -f frontend/dist/index.html || (echo "[ERROR] frontend/dist 不存在，请先完整构建" && exit 1)
+
+      # ---------- 解析版本号：优先 tag（去掉 v 前缀），回退到 launcher/version.py ----------
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="$(python -c 'from launcher.version import CURRENT_VERSION; print(CURRENT_VERSION)')"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "[INFO] Resolved version: v${VERSION}"
+
+      # ---------- [3/6] Nuitka 编译 launcher（Windows runner 自带 MSVC，自动检测）----------
+      - name: Nuitka compile launcher
+        shell: bash
+        run: |
+          python -m nuitka \
+            --standalone \
+            --assume-yes-for-downloads \
+            --windows-console-mode=disable \
+            --windows-company-name=XianyuAutoReply \
+            --windows-product-name=XianyuAutoReply \
+            --windows-product-version=${{ steps.ver.outputs.version }}.0 \
+            --windows-file-version=${{ steps.ver.outputs.version }}.0 \
+            --output-filename=XianyuAutoReply.exe \
+            --output-dir=build_output \
+            --include-package=launcher \
+            --include-package=common \
+            --include-package=http \
+            --include-package=urllib \
+            --include-package=email \
+            --include-package=playwright \
+            --include-package-data=playwright \
+            --include-package=uvicorn \
+            --include-package=fastapi \
+            --include-package=sqlalchemy \
+            --include-package=pydantic \
+            --include-package=pydantic_settings \
+            --include-package=email_validator \
+            --include-package=asyncmy \
+            --include-package=pymysql \
+            --include-package=redis \
+            --include-package=aiohttp \
+            --include-package=aiohttp_socks \
+            --include-package=httpx \
+            --include-package=httpcore \
+            --include-package=loguru \
+            --include-package=passlib \
+            --include-package=jose \
+            --include-package=Crypto \
+            --include-package=websockets \
+            --include-package=multipart \
+            --include-package=PIL \
+            --include-package=anyio \
+            --include-package=starlette \
+            --include-package=click \
+            --include-package=h11 \
+            --include-package=sniffio \
+            --include-package=idna \
+            --include-package=certifi \
+            --include-package=dateutil \
+            --include-package=apscheduler \
+            --include-package=python_socks \
+            --include-package=requests \
+            --include-package=pandas \
+            --include-package=openpyxl \
+            --include-package=qrcode \
+            --include-package=openai \
+            --include-package=bcrypt \
+            --nofollow-import-to=test \
+            --nofollow-import-to=tests \
+            --nofollow-import-to=docs \
+            --nofollow-import-to=setuptools \
+            --nofollow-import-to=pip \
+            --nofollow-import-to=wheel \
+            --nofollow-import-to=nuitka \
+            --nofollow-import-to=pandas.tests \
+            --nofollow-import-to=sqlalchemy.testing \
+            --nofollow-import-to=passlib.tests \
+            --nofollow-import-to=Crypto.SelfTest \
+            --nofollow-import-to=qrcode.tests \
+            --nofollow-import-to=PyInstaller \
+            --nofollow-import-to=pygments \
+            --nofollow-import-to=pydoc \
+            --nofollow-import-to=doctest \
+            --nofollow-import-to=unittest \
+            --enable-plugin=tk-inter \
+            launcher/main.py
+
+      # ---------- [4/6] 复制项目源码、Python 运行时、标准库到 dist ----------
+      - name: Copy project files into dist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'build_output\main.dist'
+
+          # 子服务源码 + common + 前端产物
+          Copy-Item -Recurse -Force 'backend-web'   "$dist\backend-web"
+          Copy-Item -Recurse -Force 'websocket'     "$dist\websocket"
+          Copy-Item -Recurse -Force 'scheduler'     "$dist\scheduler"
+          Copy-Item -Recurse -Force 'common'        "$dist\common"
+          New-Item -ItemType Directory -Force "$dist\frontend" | Out-Null
+          Copy-Item -Recurse -Force 'frontend\dist' "$dist\frontend\dist"
+
+          # 复制 python.exe / pythonw.exe（子服务以源码方式启动时用）
+          $pyExe = (Get-Command python).Source
+          $pyDir = Split-Path $pyExe
+          Write-Host "[INFO] Python dir: $pyDir"
+          if (-not (Test-Path "$dist\python.exe"))  { Copy-Item -Force "$pyDir\python.exe"  "$dist\python.exe" }
+          if (Test-Path "$pyDir\pythonw.exe") {
+            if (-not (Test-Path "$dist\pythonw.exe")) { Copy-Item -Force "$pyDir\pythonw.exe" "$dist\pythonw.exe" }
+          } else {
+            Write-Host "[WARN] pythonw.exe 未找到，子服务可能弹出控制台窗口"
+          }
+
+          # 复制标准库 Lib（含 site-packages，提供子服务运行时依赖）
+          if (-not (Test-Path "$dist\Lib\encodings")) {
+            Copy-Item -Recurse -Force "$pyDir\Lib" "$dist\Lib"
+            Write-Host "[INFO] Python 标准库已复制到 dist"
+          }
+
+      # ---------- 安装 Chromium 到包内 ms-playwright ----------
+      - name: Bundle Chromium into package
+        shell: pwsh
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\build_output\main.dist\ms-playwright
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force "$env:PLAYWRIGHT_BROWSERS_PATH" | Out-Null
+          python -m playwright install chromium
+
+      # ---------- 清理拷贝带入的临时文件 / 敏感文件 ----------
+      - name: Clean temp files in dist
+        shell: pwsh
+        run: |
+          $dist = 'build_output\main.dist'
+          $rm = @(
+            "$dist\backend-web\logs","$dist\websocket\logs","$dist\scheduler\logs",
+            "$dist\backend-web\static\uploads","$dist\websocket\static\uploads","$dist\scheduler\static\uploads",
+            "$dist\websocket\browser_data"
+          )
+          foreach ($p in $rm) { if (Test-Path $p) { Remove-Item -Recurse -Force $p } }
+          $files = @(
+            "$dist\backend-web\.env","$dist\websocket\.env","$dist\scheduler\.env",
+            "$dist\backend-web\.env.example","$dist\websocket\.env.example","$dist\scheduler\.env.example",
+            "$dist\backend-web\pyproject.toml","$dist\websocket\pyproject.toml","$dist\scheduler\pyproject.toml"
+          )
+          foreach ($f in $files) { if (Test-Path $f) { Remove-Item -Force $f } }
+          foreach ($svc in @('backend-web','websocket','scheduler','common')) {
+            Get-ChildItem -Path "$dist\$svc" -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "$dist\$svc" -Recurse -Include '*.pyc','*.pyo' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+
+      # ---------- [5/6] 组装 release 目录 ----------
+      - name: Assemble release directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'build_output\main.dist'
+          $rel  = 'release\XianyuAutoReply'
+          New-Item -ItemType Directory -Force 'release' | Out-Null
+          Copy-Item -Recurse -Force $dist $rel
+          New-Item -ItemType Directory -Force "$rel\logs" | Out-Null
+          # 移除用户数据目录（不应打包）
+          if (Test-Path "$rel\data") { Remove-Item -Recurse -Force "$rel\data" }
+          # 确认 EXE 存在
+          if (-not (Test-Path "$rel\XianyuAutoReply.exe")) {
+            Write-Error "[ERROR] release 目录内未找到 XianyuAutoReply.exe"
+          }
+
+      # ---------- [6/6] 打包 zip（7-Zip 快速压缩，windows runner 自带）----------
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "release\app-v${{ steps.ver.outputs.version }}.zip"
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          7z a -tzip -mx=1 -mmt=on $zip ".\release\XianyuAutoReply\*"
+          Get-Item $zip | ForEach-Object { Write-Host ("[INFO] zip 大小: {0:N1} MB" -f ($_.Length/1MB)) }
+
+      # ---------- 上传为 workflow artifact（手动触发时也能下载）----------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XianyuAutoReply-v${{ steps.ver.outputs.version }}
+          path: release/app-v${{ steps.ver.outputs.version }}.zip
+          retention-days: 7
+
+      # ---------- 发布到 GitHub Release ----------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: release/app-v${{ steps.ver.outputs.version }}.zip
