@@ -230,15 +230,28 @@ class CookieManager:
         async with lock:
             task = self.tasks.pop(cookie_id, None)
             if task:
-                task.cancel()
-                try:
-                    await asyncio.wait_for(task, timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.warning(f"【{cookie_id}】等待任务停止超时（10秒），强制继续")
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(f"等待任务清理时出错: {cookie_id}, {safe_str(e)}")
+                # 任务可能此前已自行结束（例如启动时Cookie为空抛出异常）：
+                # 此时不再视为清理错误，避免误导性的 ERROR 噪音日志
+                if task.done():
+                    prev_exc = None
+                    try:
+                        prev_exc = task.exception()
+                    except asyncio.CancelledError:
+                        prev_exc = None
+                    if prev_exc is not None:
+                        logger.info(
+                            f"【{cookie_id}】任务此前已结束(原因: {safe_str(prev_exc)})，直接清理"
+                        )
+                else:
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=10.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"【{cookie_id}】等待任务停止超时（10秒），强制继续")
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"等待任务清理时出错: {cookie_id}, {safe_str(e)}")
             
             # 清理内存
             self.cookies.pop(cookie_id, None)
@@ -377,6 +390,36 @@ class CookieManager:
             "running": not task.done(),
             "connection_state": connection_state,
             "is_connected": is_connected,
+        }
+
+    def get_connection_stats(self) -> dict:
+        """统计真实 WebSocket 连接状态
+
+        遍历所有运行中的账号实例，按 connection_manager 的连接状态分类计数。
+        其中 connected 表示真正建立了 WebSocket 连接的账号数量。
+
+        Returns:
+            包含总实例数、各状态计数、已连接账号ID列表的字典
+        """
+        by_state: dict = {}
+        connected_ids = []
+        total = 0
+        for cookie_id, instance in list(self.instances.items()):
+            total += 1
+            conn_mgr = getattr(instance, 'connection_manager', None)
+            if conn_mgr and getattr(conn_mgr, 'connection_state', None):
+                state = conn_mgr.connection_state.value
+            else:
+                state = "unknown"
+            by_state[state] = by_state.get(state, 0) + 1
+            if state == "connected":
+                connected_ids.append(cookie_id)
+
+        return {
+            "total_instances": total,           # 运行中的账号实例总数
+            "connected": by_state.get("connected", 0),  # 真实 WebSocket 已连接数
+            "by_state": by_state,               # 各连接状态明细
+            "connected_account_ids": connected_ids,
         }
 
     async def start_all_tasks(self):

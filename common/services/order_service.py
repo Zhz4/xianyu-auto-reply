@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Optional, Dict
 
+import aiohttp
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,41 @@ from loguru import logger
 
 from common.models.xy_order import XYOrder
 from common.models.xy_catalog_item import XYCatalogItem
+from common.models.auto_reply_message_log import XYAutoReplyMessageLog
+
+
+# 复用的 goofish API 连接池（TCPConnector）
+# 背景：订单详情/列表等接口会被定时补发货等任务高频调用，原先每次请求都新建
+# aiohttp.ClientSession（连带新建 TCPConnector），导致 TCP 连接无法 keep-alive 复用、
+# DNS 反复解析、短时间内大量 TIME_WAIT 连接堆积，浪费 CPU 与文件描述符。
+# 这里改为共享一个进程级连接池，ClientSession 仍按调用创建（其本身开销很小），
+# 但通过 connector_owner=False 让会话关闭时不关闭连接池，从而保持长连接被后续请求复用。
+_goofish_connector: Optional[aiohttp.BaseConnector] = None
+
+
+def get_goofish_connector() -> aiohttp.BaseConnector:
+    """获取复用的 goofish API 连接池（TCPConnector）
+
+    需在事件循环内调用（aiohttp 连接器创建依赖运行中的事件循环）。
+    连接池关闭后会自动重建，保证服务长期运行的健壮性。
+    """
+    global _goofish_connector
+    if _goofish_connector is None or _goofish_connector.closed:
+        _goofish_connector = aiohttp.TCPConnector(
+            limit=100,             # 最大连接数
+            limit_per_host=100,    # 单主机最大连接数
+            ttl_dns_cache=300,     # DNS 缓存时间（秒）
+            keepalive_timeout=60,  # 空闲连接保活时间（秒）
+        )
+    return _goofish_connector
+
+
+async def close_goofish_connector() -> None:
+    """关闭复用的 goofish API 连接池（进程退出时调用）"""
+    global _goofish_connector
+    if _goofish_connector is not None and not _goofish_connector.closed:
+        await _goofish_connector.close()
+        _goofish_connector = None
 
 
 class OrderService:
@@ -68,6 +104,7 @@ class OrderService:
         is_rated: bool | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        delivery_send_status: str | None = None,
         page: int = 1,
         page_size: int = 20,
     ) -> tuple[list[XYOrder], int, Dict[str, str]]:
@@ -83,6 +120,7 @@ class OrderService:
             is_rated: 是否已评价筛选
             start_date: 开始日期（YYYY-MM-DD）
             end_date: 结束日期（YYYY-MM-DD）
+            delivery_send_status: 关联自动发货消息日志的发送状态筛选（success/failed/unknown/timeout）
             page: 页码
             page_size: 每页数量
             
@@ -149,6 +187,29 @@ class OrderService:
             except ValueError:
                 logger.warning(f"无效的结束日期格式: {end_date}")
         
+        # 关联自动发货消息日志的发送状态筛选
+        # 取每个订单号最新一条自动发货日志（以 max(id) 近似最新，与发送状态展示口径一致），
+        # 再按发送状态过滤，使列表筛选结果与“发送状态”列显示保持一致。
+        if delivery_send_status and delivery_send_status.strip():
+            latest_log_subq = (
+                select(
+                    XYAutoReplyMessageLog.order_no.label("order_no"),
+                    func.max(XYAutoReplyMessageLog.id).label("max_id"),
+                )
+                .where(
+                    XYAutoReplyMessageLog.reply_strategy == "auto_delivery",
+                    XYAutoReplyMessageLog.order_no.isnot(None),
+                )
+                .group_by(XYAutoReplyMessageLog.order_no)
+                .subquery()
+            )
+            matched_order_nos = (
+                select(XYAutoReplyMessageLog.order_no)
+                .join(latest_log_subq, XYAutoReplyMessageLog.id == latest_log_subq.c.max_id)
+                .where(XYAutoReplyMessageLog.send_status == delivery_send_status.strip())
+            )
+            conditions.append(XYOrder.order_no.in_(matched_order_nos))
+        
         if conditions:
             base_stmt = base_stmt.where(and_(*conditions))
         
@@ -173,6 +234,58 @@ class OrderService:
         item_titles = await self._get_item_titles(owner_id, item_ids)
         
         return orders, total, item_titles
+
+    async def get_delivery_log_status_map(self, order_nos: list[str]) -> Dict[str, Dict[str, str | None]]:
+        """批量查询订单对应的自动发货消息日志发送状态
+
+        以订单号关联自动发货日志（reply_strategy == 'auto_delivery'），取每个订单号
+        最新一条日志的发送状态与发送失败原因，供订单列表关联展示。
+
+        Args:
+            order_nos: 订单号列表
+
+        Returns:
+            { 订单号: {"send_status": ..., "send_fail_reason": ...} }
+            没有对应日志的订单号不会出现在返回结果中。
+        """
+        result_map: Dict[str, Dict[str, str | None]] = {}
+        valid_order_nos = [no for no in order_nos if no]
+        if not valid_order_nos:
+            return result_map
+
+        try:
+            # 先取每个订单号最新一条自动发货日志的主键（max(id) 即最新插入），
+            # 再回查该日志的发送状态与失败原因，保证与"发送状态"筛选口径完全一致。
+            latest_log_subq = (
+                select(
+                    XYAutoReplyMessageLog.order_no.label("order_no"),
+                    func.max(XYAutoReplyMessageLog.id).label("max_id"),
+                )
+                .where(
+                    XYAutoReplyMessageLog.order_no.in_(valid_order_nos),
+                    XYAutoReplyMessageLog.reply_strategy == "auto_delivery",
+                )
+                .group_by(XYAutoReplyMessageLog.order_no)
+                .subquery()
+            )
+            stmt = (
+                select(
+                    XYAutoReplyMessageLog.order_no,
+                    XYAutoReplyMessageLog.send_status,
+                    XYAutoReplyMessageLog.send_fail_reason,
+                )
+                .join(latest_log_subq, XYAutoReplyMessageLog.id == latest_log_subq.c.max_id)
+            )
+            rows = (await self.session.execute(stmt)).all()
+            for order_no, send_status, send_fail_reason in rows:
+                result_map[order_no] = {
+                    "send_status": send_status,
+                    "send_fail_reason": send_fail_reason,
+                }
+        except Exception as e:
+            logger.error(f"查询订单自动发货日志发送状态失败: {e}")
+
+        return result_map
 
     async def get_order_by_id(self, order_no: str) -> Optional[XYOrder]:
         """根据订单号获取订单"""
@@ -479,6 +592,16 @@ class OrderService:
             if existing_order:
                 # 订单已存在，准备更新字段
                 update_values = {}
+                stale_statuses = {"pending_payment", "pending_ship", "pending", "paid"}
+                terminal_statuses = {"shipped", "completed", "cancelled", "closed", "refunded"}
+                is_stale_downgrade = (
+                    existing_order.status in terminal_statuses and status in stale_statuses
+                ) or (
+                    existing_order.status in {"pending_ship", "pending", "paid"}
+                    and status == "pending_payment"
+                )
+                if status and status != existing_order.status and not is_stale_downgrade:
+                    update_values['status'] = status
                 
                 # 如果要更新item_id，需要验证商品归属
                 if item_id and not existing_order.item_id:
@@ -610,6 +733,9 @@ class OrderService:
         '交易成功': 'completed',
         '交易关闭': 'cancelled',
         '退款中': 'refunding',
+        '退款成功': 'refunded',
+        '已退款': 'refunded',
+        '退款关闭': 'cancelled',
     }
     _XIANYU_ORDER_PAGE_SIZE = 30
 
@@ -809,6 +935,7 @@ class OrderService:
                 and len(existing_orders_map) == len(unique_order_nos)
             )
 
+            page_updated = 0
             for parsed in parsed_items:
                 try:
                     result = await self._upsert_order(
@@ -821,6 +948,7 @@ class OrderService:
                         new_inserted += 1
                     elif result == 'updated':
                         updated += 1
+                        page_updated += 1
                 except Exception as e:
                     await self.session.rollback()
                     failed += 1
@@ -831,8 +959,10 @@ class OrderService:
                 f"累计{total_fetched}条, 总数{total_count}, 全页已存在={page_all_existing}"
             )
 
-            if page_all_existing:
-                logger.info(f"获取闲鱼订单: 第{page}页订单已全部存在，停止继续获取更早页")
+            # 仅当本页全部订单已存在且无状态变更时才停止翻页；
+            # 若有订单被更新（如退款导致状态变更），需继续翻页以免遗漏更早订单的状态变化。
+            if page_all_existing and page_updated == 0:
+                logger.info(f"获取闲鱼订单: 第{page}页订单已全部存在且无状态变更，停止继续获取更早页")
                 break
 
             if not next_page or page >= total_pages:
@@ -915,7 +1045,11 @@ class OrderService:
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
         }
         
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            connector=get_goofish_connector(),
+            connector_owner=False,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
             async with session.post(
                 'https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/',
                 params=params,
@@ -1375,7 +1509,11 @@ class OrderDetailService:
                 'cookie': self.cookies_str,
             }
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                connector=get_goofish_connector(),
+                connector_owner=False,
+                cookie_jar=aiohttp.DummyCookieJar(),
+            ) as session:
                 async with session.post(
                     'https://h5api.m.goofish.com/h5/mtop.idle.web.trade.order.detail/1.0/',
                     params=params,
@@ -1782,7 +1920,11 @@ class OrderStatusChecker:
                 'cookie': self.cookies_str,
             }
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                connector=get_goofish_connector(),
+                connector_owner=False,
+                cookie_jar=aiohttp.DummyCookieJar(),
+            ) as session:
                 async with session.post(
                     'https://h5api.m.goofish.com/h5/mtop.idle.web.trade.order.detail/1.0/',
                     params=params,

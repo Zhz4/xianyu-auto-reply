@@ -11,6 +11,7 @@ import type { DockRecord, DockRecordFilterParams } from '@/api/distribution'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { EditDockModal } from './EditDockModal'
+import { ConfirmModal } from '@/components/common/ConfirmModal'
 
 export function DockedProducts() {
   const { addToast } = useUIStore()
@@ -37,6 +38,8 @@ export function DockedProducts() {
   const [subDockVisibility, setSubDockVisibility] = useState('public')
   const [priceSubmitting, setPriceSubmitting] = useState(false)
   const [isEditMode, setIsEditMode] = useState(false)
+  const [deleteRecord, setDeleteRecord] = useState<DockRecord | null>(null)
+  const [deletingRecord, setDeletingRecord] = useState(false)
 
   // 提货地址弹窗状态
   const [pickupModalOpen, setPickupModalOpen] = useState(false)
@@ -137,6 +140,11 @@ export function DockedProducts() {
 
   // 切换对接状态
   const handleToggleStatus = async (record: DockRecord) => {
+    // 被上级禁用锁定的记录，分销商不可自行启用
+    if (!record.status && record.owner_disabled) {
+      addToast({ type: 'warning', message: '该对接记录已被上级禁用，无法自行启用，请联系上级分销商' })
+      return
+    }
     try {
       const updateData: Record<string, unknown> = { status: !record.status }
       // 禁用时设置禁用原因，启用时清空禁用原因
@@ -159,7 +167,7 @@ export function DockedProducts() {
 
   // 删除对接记录
   const handleDelete = async (record: DockRecord) => {
-    if (!confirm(`确定要删除对接记录「${record.dock_name}」吗？`)) return
+    setDeletingRecord(true)
     try {
       const result = await deleteDockRecord(record.id)
       if (result.success) {
@@ -170,6 +178,8 @@ export function DockedProducts() {
       }
     } catch {
       addToast({ type: 'error', message: '删除失败' })
+    } finally {
+      setDeletingRecord(false)
     }
   }
 
@@ -564,7 +574,7 @@ export function DockedProducts() {
                             <Pencil className="w-4 h-4" />
                           </button>
                           <button
-                            onClick={() => handleDelete(record)}
+                            onClick={() => setDeleteRecord(record)}
                             className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-red-500 dark:text-red-400 transition-colors"
                             title="删除"
                           >
@@ -774,6 +784,16 @@ export function DockedProducts() {
           </div>
         </div>
       )}
+      <ConfirmModal
+        isOpen={!!deleteRecord}
+        title="删除对接记录"
+        message={`确定要删除对接记录「${deleteRecord?.dock_name || ''}」吗？`}
+        confirmText="删除"
+        type="danger"
+        loading={deletingRecord}
+        onConfirm={() => deleteRecord && handleDelete(deleteRecord).finally(() => setDeleteRecord(null))}
+        onCancel={() => setDeleteRecord(null)}
+      />
     </div>
   )
 }

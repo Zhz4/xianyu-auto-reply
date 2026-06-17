@@ -54,6 +54,7 @@ export interface OrderFilterParams {
   is_rated?: boolean | null        // 是否已评价
   start_date?: string | null       // 开始日期：YYYY-MM-DD
   end_date?: string | null         // 结束日期：YYYY-MM-DD
+  delivery_send_status?: string | null  // 关联消息日志发送状态：success/failed/unknown
 }
 
 // 获取订单列表（分页）
@@ -89,14 +90,17 @@ export const getOrders = (
     if (filters.end_date) {
       params.append('end_date', filters.end_date)
     }
+    if (filters.delivery_send_status !== null && filters.delivery_send_status !== undefined && filters.delivery_send_status !== '') {
+      params.append('delivery_send_status', filters.delivery_send_status)
+    }
   }
   
   return get(`${ORDER_PREFIX}?${params.toString()}`)
 }
 
 // 获取订单详情
-export const getOrderDetail = (orderNo: string): Promise<{ success: boolean; data: OrderDetail }> => {
-  return get(`${ORDER_PREFIX}/${orderNo}`)
+export const getOrderDetail = (orderNo: string, refresh = false): Promise<{ success: boolean; data: OrderDetail }> => {
+  return get(`${ORDER_PREFIX}/${orderNo}?refresh=${refresh}`)
 }
 
 // 删除订单
@@ -110,6 +114,14 @@ export const manualDelivery = (orderNo: string): Promise<ManualDeliveryResponse>
 }
 
 // 获取闲鱼订单并同步到数据库（单独设置10分钟超时）
+export const noLogisticsDelivery = (orderNo: string): Promise<ManualDeliveryResponse> => {
+  return post(`${ORDER_PREFIX}/no-logistics-delivery`, { order_no: orderNo })
+}
+
+export const cancelOrder = (orderNo: string): Promise<ApiResponse> => {
+  return post(`${ORDER_PREFIX}/cancel`, { order_no: orderNo })
+}
+
 export const fetchXianyuOrders = (cookieId?: string): Promise<FetchXianyuOrdersResponse> => {
   return post(`${ORDER_PREFIX}/fetch-xianyu`, { cookie_id: cookieId || null }, { timeout: 600000 })
 }

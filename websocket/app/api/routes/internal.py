@@ -42,6 +42,19 @@ class DeliverOrderRequest(BaseModel):
     quantity: int = 1
 
 
+class ConfirmNoLogisticsRequest(BaseModel):
+    account_id: str
+    order_no: str
+    item_id: str
+    buyer_id: str = ""
+    is_bargain: bool = False
+
+
+class CancelOrderRequest(BaseModel):
+    account_id: str
+    order_no: str
+
+
 class CreateChatRequest(BaseModel):
     """创建单聊会话请求
     
@@ -55,6 +68,15 @@ class CreateChatRequest(BaseModel):
 class LogRetentionRequest(BaseModel):
     """日志保留天数刷新请求"""
     retention_days: int
+
+
+class SolveCaptchaRequest(BaseModel):
+    """过滑块请求（模式B：仅凭 punish 链接求解，不依赖账号/数据库）"""
+    account_id: str = ""          # 外部标识，仅用于日志与浏览器实例隔离
+    url: str                      # punish 验证链接（punish?x5secdata=...）
+    browser_timeout: int = 40     # 单次浏览器超时（秒）
+    call_type: str = "remote"     # 调用类型：local-本机 / remote-远程
+    call_user: str | None = None  # 调用用户（远程调用按秘钥查到的用户名）
 
 
 @router.post("/logs/retention")
@@ -201,13 +223,13 @@ async def stop_account(account_id: str):
 
 
 @router.post("/accounts/{account_id}/restart")
-async def restart_account(account_id: str, request: StartAccountRequest):
+async def restart_account(account_id: str, request: StartAccountRequest = None):
     """
     重启账号任务
     
     Args:
         account_id: 账号ID
-        request: 启动请求参数
+        request: 启动请求参数(可选，不传则从数据库获取Cookie)
         
     Returns:
         操作结果
@@ -215,7 +237,11 @@ async def restart_account(account_id: str, request: StartAccountRequest):
     try:
         from app.services.xianyu.cookie_manager import get_manager
         from loguru import logger
-        
+
+        # 请求体可选：未携带时使用空请求，统一从数据库获取Cookie
+        if request is None:
+            request = StartAccountRequest()
+
         # 重启前清除Token缓存，确保重新获取Token和完整Cookie
         # 注意：xy_token_cache.user_id 存的是闲鱼的 unb（myid），不是 cookie_id(account_id)
         # 因此必须先从 Cookie 中解析出 unb 再作为 user_id 参数删除
@@ -291,11 +317,114 @@ async def restart_account(account_id: str, request: StartAccountRequest):
         }
 
 
+@router.post("/captcha/solve")
+async def solve_captcha(request: SolveCaptchaRequest):
+    """过滑块（独立/无状态）：仅凭传入的 punish 链接求解滑块。
+
+    模式B：不依赖账号是否运行、不查数据库、不注入/回填 cookies。
+    成功返回解出的 x5* cookies，失败直接返回 success=false（供外部系统使用）。
+    远程调用会记录风控日志（call_type=remote，call_user=调用用户）。
+    """
+    import re
+    import time as _time
+    from loguru import logger
+
+    url = (request.url or "").strip()
+    if not url:
+        return {"success": False, "code": 400, "message": "punish 链接不能为空", "data": None}
+
+    # 清洗 account_id（外部传入，仅用于日志与浏览器实例目录隔离，防止路径注入）
+    raw_id = (request.account_id or "external").strip()
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", raw_id)[:64] or "external"
+    timeout = max(20, min(int(request.browser_timeout or 40), 120))
+    call_type = (request.call_type or "remote").strip() or "remote"
+    call_user = (request.call_user or "").strip() or None
+
+    # 记录风控日志（处理中）
+    log_id = None
+    start_ts = _time.time()
+    try:
+        from common.db.compat import db_manager
+        log_id = db_manager.add_risk_control_log(
+            cookie_id=safe_id,
+            event_type="slider_captcha",
+            event_description=f"触发场景: 远程过滑块接口, URL: {url}",
+            processing_status="processing",
+            call_type=call_type,
+            call_user=call_user,
+        )
+    except Exception as log_e:
+        logger.error(f"【过滑块接口】记录风控日志失败: {log_e}")
+
+    def _update_log(status: str, result: str, engine: str | None = None, error: str | None = None):
+        if not log_id:
+            return
+        try:
+            from common.db.compat import db_manager as _dm
+            kwargs = {"processing_status": status, "processing_result": result}
+            if engine is not None:
+                kwargs["captcha_engine"] = engine
+            if error is not None:
+                kwargs["error_message"] = error
+            _dm.update_risk_control_log(log_id=log_id, **kwargs)
+        except Exception as ue:
+            logger.error(f"【过滑块接口】更新风控日志失败: {ue}")
+
+    try:
+        from app.services.captcha.slider_stealth import run_slider_verification_with_fallback
+        from common.services.captcha.concurrency import run_browser_task
+
+        # enable_learning=True, headless=False, existing_cookies_str="", url_provider=None
+        # 不传 cookies / url_provider：链接过期或失败时直接判失败（符合模式B“失败即返回失败”）
+        success, cookies, engine = await run_browser_task(
+            run_slider_verification_with_fallback,
+            safe_id, url, True, False, timeout, "", None,
+        )
+    except Exception as e:
+        logger.error(f"【过滑块接口】account_id={safe_id} 执行异常: {e}")
+        _update_log("error", f"过滑块执行异常，耗时: {_time.time() - start_ts:.2f}秒", error=str(e))
+        return {"success": False, "code": 500, "message": f"过滑块执行异常: {str(e)}", "data": None}
+
+    duration = _time.time() - start_ts
+    if success and cookies:
+        _update_log("success", f"远程过滑块成功，耗时: {duration:.2f}秒", engine=engine)
+        return {
+            "success": True, "code": 200, "message": "过滑块成功",
+            "data": {"engine": engine, "cookies": cookies},
+        }
+    _update_log("failed", f"远程过滑块失败，耗时: {duration:.2f}秒", engine=engine)
+    return {"success": False, "code": 200, "message": "过滑块失败", "data": {"engine": engine}}
+
+
+@router.get("/accounts/connection-stats")
+async def get_connection_stats():
+    """统计真实 WebSocket 连接状态（已连接账号数量等）"""
+    try:
+        from app.services.xianyu.cookie_manager import get_manager
+
+        manager = get_manager()
+        stats = manager.get_connection_stats()
+
+        return {
+            "success": True,
+            "code": 200,
+            "message": "查询成功",
+            "data": stats,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "code": 500,
+            "message": f"查询连接统计失败: {str(e)}",
+            "data": None,
+        }
+
+
 @router.get("/accounts/{account_id}/status")
 async def get_account_status(account_id: str):
     """
     查询账号任务状态
-    
+
     Args:
         account_id: 账号ID
         
@@ -390,6 +519,65 @@ async def send_message(account_id: str, request: SendMessageRequest):
             "message": f"发送消息失败: {str(e)}",
             "data": None,
         }
+
+
+@router.post("/orders/confirm-no-logistics")
+async def confirm_no_logistics(request: ConfirmNoLogisticsRequest):
+    """无物流发货：在闲鱼确认发货但不发送任何卡券内容"""
+    from app.services.xianyu.cookie_manager import get_manager
+    from common.db.session import async_session_maker
+    from common.services.order_service import OrderService
+
+    xianyu_live = get_manager().instances.get(request.account_id)
+    if not xianyu_live:
+        return {"success": False, "code": 404, "message": "账号未连接", "data": None}
+
+    if request.is_bargain:
+        result = await xianyu_live.auto_delivery_handler.auto_freeshipping(
+            request.order_no, request.item_id, request.buyer_id
+        )
+    else:
+        result = await xianyu_live.auto_delivery_handler.auto_confirm(
+            request.order_no, request.item_id
+        )
+
+    if not result or not result.get("success"):
+        message = (result or {}).get("error") or (result or {}).get("message") or "无物流发货失败"
+        return {"success": False, "code": 400, "message": message, "data": result}
+
+    async with async_session_maker() as session:
+        await OrderService(session).update_order_delivery_info(
+            request.order_no,
+            status="shipped",
+            delivery_method="manual",
+            delivery_content="无物流发货",
+        )
+
+    return {"success": True, "code": 200, "message": "无物流发货成功", "data": result}
+
+
+@router.post("/orders/cancel")
+async def cancel_order(request: CancelOrderRequest):
+    """卖家关闭（取消）订单"""
+    from app.services.xianyu.cookie_manager import get_manager
+    from common.db.session import async_session_maker
+    from common.models import XYOrder
+    from sqlalchemy import update
+
+    xianyu_live = get_manager().instances.get(request.account_id)
+    if not xianyu_live:
+        return {"success": False, "code": 404, "message": "账号未连接", "data": None}
+
+    closed = await xianyu_live.auto_delivery_handler.close_order_by_seller(request.order_no)
+    if not closed:
+        return {"success": False, "code": 400, "message": "取消订单失败，请检查闲鱼订单状态", "data": None}
+
+    async with async_session_maker() as session:
+        await session.execute(
+            update(XYOrder).where(XYOrder.order_no == request.order_no).values(status="cancelled")
+        )
+        await session.commit()
+    return {"success": True, "code": 200, "message": "订单已取消", "data": {"order_no": request.order_no}}
 
 
 @router.post("/orders/deliver")
@@ -1555,7 +1743,9 @@ async def _standalone_password_login(account_id: str, trigger_reason: str) -> di
                 except Exception:
                     pass
         
-        result = await asyncio.to_thread(_do_login)
+        # 密码登录驱动浏览器，走浏览器任务专用线程池，避免占用默认线程池拖垮 aiohttp
+        from app.services.captcha.concurrency import run_browser_task
+        result = await run_browser_task(_do_login)
         
         if result:
             # 登录成功，更新数据库中的Cookie

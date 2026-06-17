@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Globe, Timer, ScanFace, ChevronLeft, ChevronRight, ChevronDown, ImagePlus, Filter, Repeat, MoreHorizontal, PackageCheck, Star, ShieldCheck, Flower2, Eye, EyeOff, Ban, Download, Upload, Send } from 'lucide-react'
-import { getAccountDetailsPaginated, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountsStatusBatch, closeAccountsNoticeBatch, clearTokenCacheBatch, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, checkPasswordLoginStatus, updateAccountAutoConfirm, updateAccountPauseDuration, updateAccountMessageExpireTime, updateAccountLoginInfo, updateAccountScheduledRedelivery, updateAccountScheduledRate, updateAccountAutoPolish, updateAccountConfirmBeforeSend, updateAccountSendBeforeConfirm, updateAccountAutoRedFlower, updateAccountAiReplyBlockOrderedUsers, getAIReplySettings, updateAIReplySettings, testAIConnection, fetchAIModels, AI_PROVIDER_OPTIONS, AI_PROVIDER_DEFAULT_BASE_URLS, getProxyConfig, updateProxyConfig, getFaceVerificationScreenshot, deleteFaceVerificationScreenshot, getConfirmReceiptMessage, updateConfirmReceiptMessage, uploadConfirmReceiptImage, exportAccountsExcel, importAccountsExcel, type AIProviderType, type AIModelOption, type ProxyConfig, type FaceVerificationScreenshot, type AccountFilterParams } from '@/api/accounts'
+import { getAccountDetailsPaginated, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountsStatusBatch, closeAccountsNoticeBatch, clearTokenCacheBatch, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, checkPasswordLoginStatus, updateAccountAutoConfirm, updateAccountPauseDuration, updateAccountMessageExpireTime, updateAccountReplyDelay, updateAccountLoginInfo, updateAccountScheduledRedelivery, updateAccountScheduledRate, updateAccountAutoPolish, updateAccountConfirmBeforeSend, updateAccountSendBeforeConfirm, updateAccountAutoRedFlower, updateAccountAiReplyBlockOrderedUsers, getAIReplySettings, updateAIReplySettings, testAIConnection, fetchAIModels, AI_PROVIDER_OPTIONS, AI_PROVIDER_DEFAULT_BASE_URLS, getProxyConfig, updateProxyConfig, getFaceVerificationScreenshot, deleteFaceVerificationScreenshot, getConfirmReceiptMessage, updateConfirmReceiptMessage, uploadConfirmReceiptImage, exportAccountsExcel, importAccountsExcel, type AIProviderType, type AIModelOption, type ProxyConfig, type FaceVerificationScreenshot, type AccountFilterParams } from '@/api/accounts'
 import { getDefaultReply, updateDefaultReply, uploadDefaultReplyImage } from '@/api/keywords'
 import { getAutoRateConfig, updateAutoRateConfig } from '@/api/autoRate'
 import { checkAdminDefaultPassword } from '@/api/auth'
@@ -15,7 +15,7 @@ import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { DeliveryBlockRulesModal } from './DeliveryBlockRulesModal'
 import type { AccountDetail } from '@/types'
 
-type ModalType = 'qrcode' | 'password' | 'manual' | 'edit' | 'default-reply' | 'ai-settings' | 'proxy-settings' | 'message-expire-time' | 'face-verification' | 'confirm-receipt' | 'auto-rate' | 'delivery-disabled' | null
+type ModalType = 'qrcode' | 'password' | 'manual' | 'edit' | 'default-reply' | 'ai-settings' | 'proxy-settings' | 'message-expire-time' | 'reply-delay' | 'face-verification' | 'confirm-receipt' | 'auto-rate' | 'delivery-disabled' | null
 
 interface AccountWithKeywordCount extends AccountDetail {
   keywordCount?: number
@@ -38,6 +38,7 @@ interface AccountFilters {
   auto_polish: boolean | null
   auto_confirm: boolean | null
   has_password: boolean | null
+  online: boolean | null
   disable_reason: string | null
   account_id: string | null
 }
@@ -93,6 +94,7 @@ export function Accounts() {
     auto_polish: null,
     auto_confirm: null,
     has_password: null,
+    online: null,
     disable_reason: null,
     account_id: null,
   })
@@ -194,6 +196,11 @@ export function Accounts() {
   const [messageExpireTime, setMessageExpireTime] = useState(3600)
   const [messageExpireTimeSaving, setMessageExpireTimeSaving] = useState(false)
 
+  // 自动回复延迟设置状态
+  const [replyDelayAccount, setReplyDelayAccount] = useState<AccountWithKeywordCount | null>(null)
+  const [replyDelay, setReplyDelay] = useState(0)
+  const [replyDelaySaving, setReplyDelaySaving] = useState(false)
+
   // 人脸验证状态
   const [faceVerificationAccount, setFaceVerificationAccount] = useState<AccountWithKeywordCount | null>(null)
   const [faceVerificationScreenshot, setFaceVerificationScreenshot] = useState<FaceVerificationScreenshot | null>(null)
@@ -233,6 +240,8 @@ export function Accounts() {
   const selectedCount = selectedAccountIds.length
   const batchOperating = batchAction !== null
   const allVisibleSelected = accounts.length > 0 && accounts.every(account => selectedAccountIds.includes(account.id))
+  // 是否管理员：管理员可查看全量账号，需展示账号所属用户列
+  const isAdmin = Boolean(user?.is_admin)
 
   const loadAccounts = async (page: number = pagination.page, pageSize: number = pagination.pageSize, currentFilters: AccountFilters = filters) => {
     if (!_hasHydrated || !isAuthenticated || !token) return
@@ -248,6 +257,7 @@ export function Accounts() {
       if (currentFilters.auto_polish !== null) filterParams.auto_polish = currentFilters.auto_polish
       if (currentFilters.auto_confirm !== null) filterParams.auto_confirm = currentFilters.auto_confirm
       if (currentFilters.has_password !== null) filterParams.has_password = currentFilters.has_password
+      if (currentFilters.online !== null) filterParams.online = currentFilters.online
       if (currentFilters.disable_reason && currentFilters.disable_reason.trim()) {
         filterParams.disable_reason = currentFilters.disable_reason.trim()
       }
@@ -303,6 +313,7 @@ export function Accounts() {
       auto_polish: null,
       auto_confirm: null,
       has_password: null,
+      online: null,
       disable_reason: null,
       account_id: null,
     }
@@ -1510,6 +1521,33 @@ export function Accounts() {
     }
   }
 
+  // ==================== 自动回复延迟设置 ====================
+  const openReplyDelayModal = (account: AccountWithKeywordCount) => {
+    setReplyDelayAccount(account)
+    setReplyDelay(account.reply_delay_seconds || 0)
+    setActiveModal('reply-delay')
+  }
+
+  const handleSaveReplyDelay = async () => {
+    if (!replyDelayAccount) return
+
+    try {
+      setReplyDelaySaving(true)
+      const result = await updateAccountReplyDelay(replyDelayAccount.id, replyDelay)
+      if (result.success) {
+        addToast({ type: 'success', message: '自动回复延迟时间已保存' })
+        closeModal()
+        loadAccounts()
+      } else {
+        addToast({ type: 'error', message: result.message || '保存失败' })
+      }
+    } catch {
+      addToast({ type: 'error', message: '保存失败' })
+    } finally {
+      setReplyDelaySaving(false)
+    }
+  }
+
   // ==================== 人脸验证 ====================
   const openFaceVerificationModal = async (account: AccountWithKeywordCount) => {
     setFaceVerificationAccount(account)
@@ -1715,6 +1753,17 @@ export function Accounts() {
           <h2 className="vben-card-title ">
             <Plus className="w-4 h-4" />
             添加新账号
+            <span className="ml-2 text-xs font-normal text-slate-500 dark:text-slate-400">
+              获取Cookie工具地址：
+              <a
+                href="https://github.com/zhinianboke/packet-capture-tool"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 dark:text-blue-400 hover:underline break-all"
+              >
+                https://github.com/zhinianboke/packet-capture-tool
+              </a>
+            </span>
           </h2>
         </div>
         <div className="vben-card-body">
@@ -1987,6 +2036,20 @@ export function Accounts() {
                 </select>
               </div>
 
+              {/* 在线状态筛选（口径同仪表盘“在线账号”） */}
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-gray-500 dark:text-gray-400">在线状态</label>
+                <select
+                  value={filters.online === null ? '' : String(filters.online)}
+                  onChange={(e) => handleFilterChange('online', e.target.value === '' ? null : e.target.value === 'true')}
+                  className="px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">全部</option>
+                  <option value="true">在线</option>
+                  <option value="false">离线</option>
+                </select>
+              </div>
+
               {/* 账号ID筛选（模糊搜索，回车/失焦/查询按钮均会提交） */}
               <div className="flex flex-col gap-1 col-span-2">
                 <label className="text-xs text-gray-500 dark:text-gray-400">账号ID</label>
@@ -2055,7 +2118,7 @@ export function Accounts() {
               <RefreshCw className="w-6 h-6 animate-spin text-blue-500" />
             </div>
           ) : (
-            <table className="table-ios min-w-[1400px]">
+            <table className="table-ios" style={{ minWidth: 'max-content' }}>
               <thead className="sticky top-0 bg-white dark:bg-slate-800 z-10">
                 <tr>
                   <th className="w-10">
@@ -2068,12 +2131,14 @@ export function Accounts() {
                     />
                   </th>
                   <th className="whitespace-nowrap min-w-[180px]">账号ID</th>
+                  {isAdmin && <th className="whitespace-nowrap min-w-[120px]">所属用户</th>}
                   <th className="whitespace-nowrap min-w-[80px]">关键词</th>
                   <th className="whitespace-nowrap min-w-[80px]">过滤词</th>
                   <th className="whitespace-nowrap min-w-[80px]">今日回复</th>
                   <th className="whitespace-nowrap min-w-[120px]">状态</th>
+                  <th className="whitespace-nowrap min-w-[90px]">在线状态</th>
                   <th className="whitespace-nowrap min-w-[90px]">配置密码</th>
-                  <th className="whitespace-nowrap min-w-[280px]">功能开关</th>
+                  <th className="whitespace-nowrap min-w-[340px]">功能开关</th>
                   <th className="whitespace-nowrap min-w-[90px]">暂停时间</th>
                   <th className="whitespace-nowrap min-w-[160px] sticky right-0 bg-slate-50 dark:bg-slate-800 z-20">操作</th>
                 </tr>
@@ -2081,7 +2146,7 @@ export function Accounts() {
               <tbody>
                 {accounts.length === 0 ? (
                   <tr>
-                    <td colSpan={10}>
+                    <td colSpan={isAdmin ? 12 : 11}>
                       <div className="empty-state py-8">
                         <p className="text-slate-500 dark:text-slate-400">暂无账号，请添加新账号</p>
                       </div>
@@ -2101,6 +2166,11 @@ export function Accounts() {
                     <td className="font-medium text-blue-600 dark:text-blue-400">
                       {account.note ? `${account.id} (${account.note})` : account.id}
                     </td>
+                    {isAdmin && (
+                      <td className="text-sm text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                        {account.owner_username || '-'}
+                      </td>
+                    )}
                     <td>
                       <span className="inline-flex items-center gap-1.5 text-sm">
                         <MessageSquare className="w-3.5 h-3.5 text-blue-500" />
@@ -2140,6 +2210,16 @@ export function Accounts() {
                     </td>
                     <td>
                       <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-2 py-1 rounded ${
+                        account.online
+                          ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300'
+                          : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
+                      }`}>
+                        <span className={`status-dot ${account.online ? 'status-dot-success' : 'status-dot-danger'}`} />
+                        {account.online ? '在线' : '离线'}
+                      </span>
+                    </td>
+                    <td>
+                      <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-2 py-1 rounded ${
                         (account.username && account.login_password)
                           ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300' 
                           : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
@@ -2150,7 +2230,7 @@ export function Accounts() {
                     </td>
                     {/* 功能开关组：7 个开关合并为紧凑图标组，点击切换，hover 查看说明 */}
                     <td>
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1 [&>button]:shrink-0">
                         {/* AI回复 */}
                         <button
                           onClick={() => handleToggleAI(account)}
@@ -2369,6 +2449,13 @@ export function Accounts() {
                     >
                       <Timer className="w-3.5 h-3.5 text-orange-500" />
                       <span className="text-slate-700 dark:text-slate-300">消息等待</span>
+                    </button>
+                    <button
+                      onClick={() => { openReplyDelayModal(account); setMoreMenuAccountId(null) }}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                    >
+                      <Clock className="w-3.5 h-3.5 text-amber-500" />
+                      <span className="text-slate-700 dark:text-slate-300">延迟回复</span>
                     </button>
                     <button
                       onClick={() => { openFaceVerificationModal(account); setMoreMenuAccountId(null) }}
@@ -3704,6 +3791,110 @@ export function Accounts() {
                 disabled={messageExpireTimeSaving}
               >
                 {messageExpireTimeSaving ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    保存中...
+                  </span>
+                ) : (
+                  '保存'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 自动回复延迟设置弹窗 */}
+      {activeModal === 'reply-delay' && replyDelayAccount && (
+        <div className="modal-overlay">
+          <div className="modal-content max-w-md">
+            <div className="modal-header">
+              <h2 className="modal-title">自动回复延迟</h2>
+              <button onClick={closeModal} className="modal-close">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="modal-body space-y-4">
+              <div className="bg-blue-50 dark:bg-blue-900/20 rounded-lg p-3 text-sm text-blue-700 dark:text-blue-300">
+                <p>账号: <span className="font-medium">{replyDelayAccount.id}</span></p>
+              </div>
+
+              <div className="input-group">
+                <label className="input-label">延迟时间（秒）</label>
+                <input
+                  type="number"
+                  value={replyDelay}
+                  onChange={(e) => setReplyDelay(Math.max(0, Math.min(3600, parseInt(e.target.value) || 0)))}
+                  className="input-ios"
+                  min={0}
+                  max={3600}
+                  step={1}
+                />
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                  {replyDelay === 0
+                    ? '当前设置: 立即回复（不延迟）'
+                    : `当前设置: 延迟 ${replyDelay} 秒后回复`}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-5 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setReplyDelay(0)}
+                  className={`px-3 py-2 text-xs rounded-lg border transition-colors ${replyDelay === 0 ? 'bg-blue-500 text-white border-blue-500' : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
+                >
+                  立即
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReplyDelay(3)}
+                  className={`px-3 py-2 text-xs rounded-lg border transition-colors ${replyDelay === 3 ? 'bg-blue-500 text-white border-blue-500' : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
+                >
+                  3秒
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReplyDelay(5)}
+                  className={`px-3 py-2 text-xs rounded-lg border transition-colors ${replyDelay === 5 ? 'bg-blue-500 text-white border-blue-500' : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
+                >
+                  5秒
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReplyDelay(10)}
+                  className={`px-3 py-2 text-xs rounded-lg border transition-colors ${replyDelay === 10 ? 'bg-blue-500 text-white border-blue-500' : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
+                >
+                  10秒
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReplyDelay(30)}
+                  className={`px-3 py-2 text-xs rounded-lg border transition-colors ${replyDelay === 30 ? 'bg-blue-500 text-white border-blue-500' : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
+                >
+                  30秒
+                </button>
+              </div>
+
+              <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3 text-xs text-slate-500 dark:text-slate-400">
+                <p className="font-medium mb-1">说明：</p>
+                <ul className="space-y-0.5 list-disc list-inside">
+                  <li>自动回复在发送前会先等待设定的秒数</li>
+                  <li>设为0表示立即回复，不做延迟</li>
+                  <li>延迟可让回复显得更自然，降低风控风险</li>
+                  <li>最大可设置 3600 秒（1小时）</li>
+                </ul>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button type="button" onClick={closeModal} className="btn-ios-secondary" disabled={replyDelaySaving}>
+                取消
+              </button>
+              <button
+                onClick={handleSaveReplyDelay}
+                className="btn-ios-primary"
+                disabled={replyDelaySaving}
+              >
+                {replyDelaySaving ? (
                   <span className="flex items-center gap-2">
                     <Loader2 className="w-4 h-4 animate-spin" />
                     保存中...

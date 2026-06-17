@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Calendar, ChevronLeft, ChevronRight, MessageSquare, RefreshCw } from 'lucide-react'
 import { getAccountDetails } from '@/api/accounts'
 import { getAutoReplyLogs, type AutoReplyLogItem } from '@/api/autoReplyLogs'
@@ -14,6 +14,7 @@ const REPLY_STRATEGY_LABELS: Record<string, string> = {
   keyword: '关键词回复',
   ai: 'AI回复',
   default: '默认回复',
+  auto_delivery: '自动发货',
 }
 
 const DEFAULT_SCOPE_LABELS: Record<string, string> = {
@@ -47,6 +48,7 @@ const DECISION_REASON_LABELS: Record<string, string> = {
   send_failed: '发送失败',
   no_rule_matched: '未匹配回复规则',
   failed: '处理失败',
+  auto_delivery: '自动发货',
   chat_paused: '会话已暂停',
   empty_reply: '回复内容为空',
   default_reply_once: '默认回复仅回复一次',
@@ -99,6 +101,27 @@ function buildDecisionReasonLabel(value?: string | null) {
   return DECISION_REASON_LABELS[value] || value
 }
 
+const SEND_STATUS_LABELS: Record<string, string> = {
+  success: '发送成功',
+  failed: '发送失败',
+  unknown: '待确认',
+  timeout: '超时',
+}
+
+const SEND_STATUS_CLASSES: Record<string, string> = {
+  success: 'text-green-600 dark:text-green-400',
+  failed: 'text-red-600 dark:text-red-400',
+  unknown: 'text-slate-500 dark:text-slate-400',
+  timeout: 'text-amber-600 dark:text-amber-400',
+}
+
+function buildSendStatusLabel(value?: string | null) {
+  const key = value || 'unknown'
+  const label = SEND_STATUS_LABELS[key] || key
+  const cls = SEND_STATUS_CLASSES[key] || SEND_STATUS_CLASSES.unknown
+  return <span className={`font-medium ${cls}`}>{label}</span>
+}
+
 function renderText(value?: string | null) {
   if (!value) {
     return '-'
@@ -115,6 +138,8 @@ export function AutoReplyLogs() {
   const [accounts, setAccounts] = useState<AccountDetail[]>([])
   const [selectedAccount, setSelectedAccount] = useState('')
   const [selectedRuleType, setSelectedRuleType] = useState('')
+  const [selectedSendStatus, setSelectedSendStatus] = useState('')
+  const [messageType, setMessageType] = useState('auto_reply')
   const [startDate, setStartDate] = useState(today)
   const [endDate, setEndDate] = useState(today)
   const [page, setPage] = useState(1)
@@ -153,7 +178,9 @@ export function AutoReplyLogs() {
         account_id: selectedAccount || undefined,
         start_date: startDate || undefined,
         end_date: endDate || undefined,
-        matched_rule_type: selectedRuleType || undefined,
+        matched_rule_type: messageType === 'auto_delivery' ? undefined : (selectedRuleType || undefined),
+        send_status: selectedSendStatus || undefined,
+        message_type: messageType,
         page: nextPage,
         page_size: nextPageSize,
       })
@@ -186,6 +213,16 @@ export function AutoReplyLogs() {
   useEffect(() => {
     loadLogs(1, pageSize)
   }, [])
+
+  // 切换消息类型时自动重新查询（跳过首次挂载，避免与初始查询重复）
+  const messageTypeMountedRef = useRef(false)
+  useEffect(() => {
+    if (!messageTypeMountedRef.current) {
+      messageTypeMountedRef.current = true
+      return
+    }
+    loadLogs(1, pageSize)
+  }, [messageType]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleSearch = () => {
     loadLogs(1, pageSize)
@@ -240,18 +277,45 @@ export function AutoReplyLogs() {
               <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="input-ios" />
             </div>
             <div className="input-group min-w-[160px]">
-              <label className="input-label">规则类型</label>
+              <label className="input-label">消息类型</label>
               <select
-                value={selectedRuleType}
-                onChange={(e) => setSelectedRuleType(e.target.value)}
+                value={messageType}
+                onChange={(e) => setMessageType(e.target.value)}
                 className="input-ios"
               >
-                <option value="">全部类型</option>
-                <option value="keyword_item">商品关键词</option>
-                <option value="keyword_common">通用关键词</option>
-                <option value="ai">AI回复</option>
-                <option value="default_item">商品默认回复</option>
-                <option value="default_account">账号默认回复</option>
+                <option value="auto_reply">自动回复</option>
+                <option value="auto_delivery">自动发货</option>
+              </select>
+            </div>
+            {messageType !== 'auto_delivery' && (
+              <div className="input-group min-w-[160px]">
+                <label className="input-label">规则类型</label>
+                <select
+                  value={selectedRuleType}
+                  onChange={(e) => setSelectedRuleType(e.target.value)}
+                  className="input-ios"
+                >
+                  <option value="">全部类型</option>
+                  <option value="keyword_item">商品关键词</option>
+                  <option value="keyword_common">通用关键词</option>
+                  <option value="ai">AI回复</option>
+                  <option value="default_item">商品默认回复</option>
+                  <option value="default_account">账号默认回复</option>
+                </select>
+              </div>
+            )}
+            <div className="input-group min-w-[160px]">
+              <label className="input-label">发送状态</label>
+              <select
+                value={selectedSendStatus}
+                onChange={(e) => setSelectedSendStatus(e.target.value)}
+                className="input-ios"
+              >
+                <option value="">全部状态</option>
+                <option value="success">发送成功</option>
+                <option value="failed">发送失败</option>
+                <option value="unknown">待确认</option>
+                <option value="timeout">超时</option>
               </select>
             </div>
             <button onClick={handleSearch} className="btn-ios-primary">
@@ -283,6 +347,7 @@ export function AutoReplyLogs() {
                   <th>账号</th>
                   <th>发送方</th>
                   <th>商品</th>
+                  <th>订单号</th>
                   <th>策略</th>
                   <th>回复类型</th>
                   <th>命中关键词</th>
@@ -290,6 +355,8 @@ export function AutoReplyLogs() {
                   <th>收到消息时间</th>
                   <th>收到消息</th>
                   <th>回复内容</th>
+                  <th>发送状态</th>
+                  <th>发送失败原因</th>
                   <th>AI模型</th>
                   <th>会话ID</th>
                   <th>消息ID</th>
@@ -300,7 +367,7 @@ export function AutoReplyLogs() {
               <tbody>
                 {logs.length === 0 ? (
                   <tr>
-                    <td colSpan={16}>
+                    <td colSpan={19}>
                       <div className="empty-state py-8">
                         <p className="text-slate-500 dark:text-slate-400">暂无消息日志</p>
                       </div>
@@ -325,6 +392,7 @@ export function AutoReplyLogs() {
                         <div className="font-medium">{renderText(log.item_title)}</div>
                         <div className="text-xs text-slate-500 dark:text-slate-400 break-all">{renderText(log.item_id)}</div>
                       </td>
+                      <td className="align-top min-w-[180px] break-all">{renderText(log.order_no)}</td>
                       <td className="align-top whitespace-nowrap">{buildStrategyLabel(log)}</td>
                       <td className="align-top whitespace-nowrap">{buildReplyModeLabel(log.reply_mode)}</td>
                       <td className="align-top min-w-[160px] break-all">{renderText(log.matched_keyword)}</td>
@@ -337,6 +405,8 @@ export function AutoReplyLogs() {
                           <div className="mt-1 text-xs text-blue-600 dark:text-blue-400 break-all">{log.reply_image_url}</div>
                         ) : null}
                       </td>
+                      <td className="align-top whitespace-nowrap">{buildSendStatusLabel(log.send_status)}</td>
+                      <td className="align-top min-w-[220px] max-w-[320px] whitespace-pre-wrap break-words text-red-600 dark:text-red-400">{renderText(log.send_fail_reason)}</td>
                       <td className="align-top min-w-[180px]">
                         <div>{renderText(log.ai_model_name)}</div>
                         <div className="text-xs text-slate-500 dark:text-slate-400">{renderText(log.ai_provider_name)}</div>

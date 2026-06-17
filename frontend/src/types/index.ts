@@ -43,6 +43,7 @@ export interface Account {
   owner_id?: number
   cookie: string
   enabled: boolean
+  online?: boolean  // 在线状态：是否已建立真实 WebSocket 连接（口径同仪表盘“在线账号”）
   use_ai_reply: boolean
   use_default_reply: boolean
   auto_confirm: boolean
@@ -75,8 +76,10 @@ export interface AccountDetail extends Account {
   keywordCount?: number
   aiEnabled?: boolean
   message_expire_time?: number
+  reply_delay_seconds?: number
   filter_count?: number  // 消息过滤规则数量
   today_reply_count?: number
+  owner_username?: string  // 账号所属用户名（管理员查看全量时展示）
 }
 
 // 关键词相关类型
@@ -145,6 +148,8 @@ export interface Order {
   delivery_method?: 'manual' | 'auto' | 'scheduled'  // 发货方式：manual-手动发货, auto-自动发货, scheduled-定时发货
   delivery_content?: string  // 发货内容（卡券内容）
   delivery_fail_reason?: string  // 发货失败原因
+  delivery_send_status?: 'success' | 'failed' | 'unknown' | 'timeout' | null  // 关联消息日志：发送状态
+  delivery_send_fail_reason?: string | null  // 关联消息日志：发送失败原因
   is_agent_order?: boolean  // 是否是代销订单
   source?: string  // 数据来源
   placed_at?: string  // 订单时间（下单时间）
@@ -153,10 +158,14 @@ export interface Order {
 }
 
 export type OrderStatus = 
+  | 'pending_payment'
   | 'processing' 
   | 'processed' 
+  | 'pending_ship'
   | 'shipped' 
   | 'completed' 
+  | 'refunding'
+  | 'refunded'
   | 'cancelled' 
   | 'unknown'
 

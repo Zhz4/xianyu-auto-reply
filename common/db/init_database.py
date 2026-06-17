@@ -255,6 +255,13 @@ class DatabaseInitializer:
             True,
             "定时备份数据库所有表结构与数据到文件",
         ),
+        (
+            "delivery_timeout",
+            "发货超时检测任务",
+            60,
+            True,
+            "定时将超过阈值仍处于 unknown 的自动发货消息日志标记为 timeout",
+        ),
     )
     
     # ========== 所有数据表的DDL定义 ==========
@@ -335,6 +342,7 @@ class DatabaseInitializer:
                 proxy_user VARCHAR(120) COMMENT '代理用户名',
                 proxy_pass VARCHAR(255) COMMENT '代理密码',
                 message_expire_time INT DEFAULT 3600 COMMENT '相同消息等待时间(秒)',
+                reply_delay_seconds INT DEFAULT 0 COMMENT '自动回复延迟时间(秒)，0表示立即回复',
                 disable_reason VARCHAR(255) COMMENT '禁用原因',
                 scheduled_redelivery TINYINT(1) NOT NULL DEFAULT 0 COMMENT '定时补发货开关',
                 scheduled_rate TINYINT(1) NOT NULL DEFAULT 0 COMMENT '定时补评价开关',
@@ -343,7 +351,7 @@ class DatabaseInitializer:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 INDEX idx_owner_id (owner_id),
-                INDEX idx_account_id (account_id),
+                UNIQUE KEY uk_account_id (account_id),
                 INDEX idx_unb (unb),
                 INDEX idx_account_created (created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='闲鱼账号表';
@@ -534,6 +542,9 @@ class DatabaseInitializer:
                 event_description TEXT COMMENT '事件描述',
                 processing_result TEXT COMMENT '处理结果',
                 processing_status VARCHAR(32) DEFAULT 'processing' COMMENT '处理状态',
+                captcha_engine VARCHAR(32) DEFAULT NULL COMMENT '验证通过引擎：playwright-主引擎/drissionpage-兜底引擎/real_mouse-真人鼠标引擎',
+                call_type VARCHAR(16) DEFAULT 'local' COMMENT '调用类型：local-本机/remote-远程(外部凭秘钥调用)',
+                call_user VARCHAR(128) DEFAULT NULL COMMENT '调用用户：仅远程调用记录(按秘钥查到的用户名)',
                 error_message TEXT COMMENT '错误信息',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
@@ -949,6 +960,7 @@ class DatabaseInitializer:
                 delivery_count INT NOT NULL DEFAULT 0 COMMENT '发货次数',
                 status TINYINT(1) DEFAULT 1 COMMENT '对接状态：1启用 0停用',
                 disable_reason VARCHAR(255) DEFAULT NULL COMMENT '禁用原因',
+                owner_disabled TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被上级禁用锁定：1是 0否',
                 level INT NOT NULL DEFAULT 1 COMMENT '分销层级：1=一级分销，2=二级分销',
                 parent_dock_id BIGINT DEFAULT NULL COMMENT '上级对接记录ID，一级分销为NULL',
                 source_user_id BIGINT DEFAULT NULL COMMENT '上级分销商用户ID，一级分销为NULL',
@@ -1195,6 +1207,7 @@ class DatabaseInitializer:
                 chat_id VARCHAR(128) NOT NULL COMMENT '聊天会话ID',
                 item_id VARCHAR(64) DEFAULT NULL COMMENT '商品ID',
                 item_title VARCHAR(255) DEFAULT NULL COMMENT '商品标题',
+                order_no VARCHAR(64) DEFAULT NULL COMMENT '订单号（自动发货等场景关联订单）',
                 source_message_id VARCHAR(128) DEFAULT NULL COMMENT '源消息ID',
                 sender_user_id VARCHAR(64) NOT NULL COMMENT '发送方闲鱼用户ID',
                 sender_user_name VARCHAR(120) DEFAULT NULL COMMENT '发送方昵称',
@@ -1214,6 +1227,8 @@ class DatabaseInitializer:
                 reply_image_url VARCHAR(1000) DEFAULT NULL COMMENT '回复图片URL',
                 reply_segments JSON DEFAULT NULL COMMENT '拆分后的回复分段',
                 error_message TEXT COMMENT '错误信息',
+                send_status VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)/timeout-超时(无响应超过阈值)',
+                send_fail_reason TEXT COMMENT '发送失败原因（如被安全拦截的明文文案）',
                 raw_message_json JSON DEFAULT NULL COMMENT '原始消息JSON',
                 context_snapshot JSON DEFAULT NULL COMMENT '上下文快照',
                 send_result_json JSON DEFAULT NULL COMMENT '发送结果快照',
@@ -1224,6 +1239,7 @@ class DatabaseInitializer:
                 INDEX idx_account_id (account_id),
                 INDEX idx_chat_id (chat_id),
                 INDEX idx_item_id (item_id),
+                INDEX idx_order_no (order_no),
                 INDEX idx_source_message_id (source_message_id),
                 INDEX idx_sender_user_id (sender_user_id),
                 INDEX idx_process_status (process_status),
@@ -1235,7 +1251,8 @@ class DatabaseInitializer:
                 INDEX idx_arml_owner_status_created (owner_id, process_status, created_at),
                 INDEX idx_arml_status_created (process_status, created_at),
                 INDEX idx_arml_status_strategy_created (process_status, reply_strategy, created_at),
-                INDEX idx_arml_strategy_created (reply_strategy, created_at)
+                INDEX idx_arml_strategy_created (reply_strategy, created_at),
+                INDEX idx_arml_order_strategy_id (order_no, reply_strategy, id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='自动回复消息日志表';
         """,
 
@@ -1380,10 +1397,34 @@ class DatabaseInitializer:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='闲鱼黑名单表';
         """,
 
+        # 51. 在线聊天快捷短语表
+        "xy_chat_quick_phrases": """
+            CREATE TABLE IF NOT EXISTS xy_chat_quick_phrases (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+                owner_id BIGINT NOT NULL COMMENT '归属用户（本系统用户ID）',
+                title VARCHAR(80) NOT NULL COMMENT '短语标题',
+                content TEXT NOT NULL COMMENT '短语内容（发送的文本）',
+                sort_order INT NOT NULL DEFAULT 0 COMMENT '排序值，越小越靠前',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX ix_xy_chat_quick_phrases_owner_id (owner_id),
+                INDEX idx_chat_quick_phrase_owner_sort (owner_id, sort_order)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='在线聊天快捷短语';
+        """,
     }
     
     # 字段迁移定义：表名 -> [(字段名, 字段定义, 在哪个字段后面)]
     COLUMN_MIGRATIONS = {
+        "xy_auto_reply_message_logs": [
+            ("send_status", "VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)/timeout-超时(无响应超过阈值)'", "error_message"),
+            ("send_fail_reason", "TEXT COMMENT '发送失败原因（如被安全拦截的明文文案）'", "send_status"),
+            ("order_no", "VARCHAR(64) DEFAULT NULL COMMENT '订单号（自动发货等场景关联订单）'", "item_title"),
+        ],
+        "xy_risk_control_logs": [
+            ("captcha_engine", "VARCHAR(32) DEFAULT NULL COMMENT '验证通过引擎：playwright-主引擎/drissionpage-兜底引擎/real_mouse-真人鼠标引擎'", "processing_status"),
+            ("call_type", "VARCHAR(16) DEFAULT 'local' COMMENT '调用类型：local-本机/remote-远程(外部凭秘钥调用)'", "captcha_engine"),
+            ("call_user", "VARCHAR(128) DEFAULT NULL COMMENT '调用用户：仅远程调用记录(按秘钥查到的用户名)'", "call_type"),
+        ],
         "xy_accounts": [
             ("proxy_type", "VARCHAR(20) DEFAULT 'none' COMMENT '代理类型'", "last_refresh_at"),
             ("proxy_host", "VARCHAR(255) COMMENT '代理主机'", "proxy_type"),
@@ -1391,6 +1432,7 @@ class DatabaseInitializer:
             ("proxy_user", "VARCHAR(120) COMMENT '代理用户名'", "proxy_port"),
             ("proxy_pass", "VARCHAR(255) COMMENT '代理密码'", "proxy_user"),
             ("message_expire_time", "INT DEFAULT 3600 COMMENT '相同消息等待时间(秒)'", "proxy_pass"),
+            ("reply_delay_seconds", "INT DEFAULT 0 COMMENT '自动回复延迟时间(秒)，0表示立即回复'", "message_expire_time"),
             ("disable_reason", "VARCHAR(255) COMMENT '禁用原因'", "message_expire_time"),
             ("scheduled_redelivery", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '定时补发货开关'", "disable_reason"),
             ("scheduled_rate", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '定时补评价开关'", "scheduled_redelivery"),
@@ -1431,6 +1473,7 @@ class DatabaseInitializer:
         "xy_dock_records": [
             ("delivery_count", "INT NOT NULL DEFAULT 0 COMMENT '发货次数'", "remark"),
             ("disable_reason", "VARCHAR(255) DEFAULT NULL COMMENT '禁用原因'", "status"),
+            ("owner_disabled", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被上级禁用锁定：1是 0否'", "disable_reason"),
             ("level", "INT NOT NULL DEFAULT 1 COMMENT '分销层级：1=一级分销，2=二级分销'", "disable_reason"),
             ("parent_dock_id", "BIGINT DEFAULT NULL COMMENT '上级对接记录ID，一级分销为NULL'", "level"),
             ("source_user_id", "BIGINT DEFAULT NULL COMMENT '上级分销商用户ID，一级分销为NULL'", "parent_dock_id"),
@@ -2523,6 +2566,40 @@ class DatabaseInitializer:
                 except Exception as e:
                     logger.warning(f"✗ xy_auto_reply_message_logs idx_arml_status_created 创建失败: {e}")
 
+                try:
+                    check = text("""
+                        SELECT COUNT(*) FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'xy_auto_reply_message_logs'
+                        AND INDEX_NAME = 'idx_order_no'
+                    """)
+                    result = await conn.execute(check)
+                    if result.scalar() == 0:
+                        await conn.execute(text(
+                            "ALTER TABLE xy_auto_reply_message_logs ADD INDEX idx_order_no (order_no)"
+                        ))
+                        logger.info("✓ xy_auto_reply_message_logs: 创建 idx_order_no 索引")
+                except Exception as e:
+                    logger.warning(f"✗ xy_auto_reply_message_logs idx_order_no 创建失败: {e}")
+
+                # 补建 (order_no, reply_strategy, id) 复合索引 —— 加速「按订单号+回复策略取最新一条日志」的查询
+                # （订单列表关联自动发货发送状态：WHERE reply_strategy='auto_delivery' AND order_no IN (...) GROUP BY order_no, MAX(id)）
+                try:
+                    check = text("""
+                        SELECT COUNT(*) FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'xy_auto_reply_message_logs'
+                        AND INDEX_NAME = 'idx_arml_order_strategy_id'
+                    """)
+                    result = await conn.execute(check)
+                    if result.scalar() == 0:
+                        await conn.execute(text(
+                            "ALTER TABLE xy_auto_reply_message_logs ADD INDEX idx_arml_order_strategy_id (order_no, reply_strategy, id)"
+                        ))
+                        logger.info("✓ xy_auto_reply_message_logs: 创建 idx_arml_order_strategy_id 复合索引")
+                except Exception as e:
+                    logger.warning(f"✗ xy_auto_reply_message_logs idx_arml_order_strategy_id 创建失败: {e}")
+
             # 为 xy_dock_records 补建 (source_user_id, level) 复合索引 —— 加速二级分销商列表查询
             try:
                 check = text("""
@@ -2645,6 +2722,45 @@ class DatabaseInitializer:
                         logger.info("✓ xy_orders: 创建 uk_order_account_no 唯一约束")
             except Exception as e:
                 logger.warning(f"✗ xy_orders uk_order_account_no 创建失败: {e}")
+
+            # 为 xy_accounts 补建 account_id 全局唯一约束 —— 闲鱼账号ID全局唯一，
+            # 杜绝不同用户绑定同一账号、以及并发创建导致的重复（业务大量代码仅按
+            # account_id 查询并取 first，依赖其全局唯一）。
+            # 注意：项目硬性规范禁止删除数据，存在历史重复数据时不自动清理，
+            # 仅打印警告并跳过创建，待人工合并后下次启动自检再补建。
+            try:
+                check = text("""
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'xy_accounts'
+                    AND INDEX_NAME = 'uk_account_id'
+                """)
+                result = await conn.execute(check)
+                if result.scalar() == 0:
+                    # 先检测是否存在 account_id 重复数据（全局，不区分 owner_id）
+                    dup_check = text("""
+                        SELECT COUNT(*) FROM (
+                            SELECT account_id
+                            FROM xy_accounts
+                            GROUP BY account_id
+                            HAVING COUNT(*) > 1
+                        ) AS dup
+                    """)
+                    dup_result = await conn.execute(dup_check)
+                    dup_groups = dup_result.scalar() or 0
+                    if dup_groups > 0:
+                        logger.warning(
+                            f"✗ xy_accounts 存在 {dup_groups} 组 account_id 重复数据，"
+                            f"为遵守禁止删除数据规范，暂不创建 uk_account_id 唯一约束。"
+                            f"请人工合并/处理重复账号后，重启服务自动补建"
+                        )
+                    else:
+                        await conn.execute(text(
+                            "ALTER TABLE xy_accounts ADD UNIQUE KEY uk_account_id (account_id)"
+                        ))
+                        logger.info("✓ xy_accounts: 创建 uk_account_id 全局唯一约束")
+            except Exception as e:
+                logger.warning(f"✗ xy_accounts uk_account_id 创建失败: {e}")
 
 
     async def create_default_admin(self):

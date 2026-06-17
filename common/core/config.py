@@ -46,6 +46,19 @@ class BaseConfig(BaseSettings):
     mysql_database: str = Field(default="xianyu_data")
     sync_driver: str = Field(default="mysql+pymysql")
     async_driver: str = Field(default="mysql+asyncmy")
+
+    # 数据库连接池配置（账号数量较大时可通过环境变量调优）
+    # 重要：db_pool_size + db_max_overflow 不应超过 MySQL 的 max_connections，
+    # 否则连接池打满后还会触发 MySQL 的 "Too many connections"。
+    # 上千账号场景的建议：保持适中的连接池 + 短连接超时，让卡住的连接快速失败并归还，
+    # 而不是无限放大连接数把远程 MySQL 压垮。
+    db_pool_size: int = Field(default=30)            # 常驻连接数
+    db_max_overflow: int = Field(default=70)         # 允许的溢出连接数（峰值 = pool_size + max_overflow）
+    db_pool_timeout: int = Field(default=30)         # 从连接池获取连接的最长等待秒数
+    db_pool_recycle: int = Field(default=1800)       # 连接回收时间（秒），防止 MySQL 主动断开陈旧连接
+    db_pool_pre_ping: bool = Field(default=True)     # 取连接前 ping 一次，自动剔除失效连接
+    db_pool_use_lifo: bool = Field(default=True)     # LIFO 复用最近使用的连接，便于空闲连接被回收，降低对远程库的常驻连接数
+    db_connect_timeout: int = Field(default=10)      # 建立 TCP 连接的超时秒数，避免远程库不可达时无限阻塞
     
     # Redis配置（敏感信息请通过环境变量或.env文件配置）
     redis_host: str = Field(default="localhost")
@@ -60,7 +73,11 @@ class BaseConfig(BaseSettings):
     jwt_algorithm: str = Field(default="HS256")
     access_token_expire_minutes: int = Field(default=30)
     refresh_token_expire_minutes: int = Field(default=60 * 24 * 7)
-    
+
+    # 服务监听地址：`::` 同时监听 IPv4 和 IPv6（dual-stack），
+    # 适用于 Linux/macOS；如需仅监听 IPv4 可设为 0.0.0.0
+    host: str = Field(default="::")
+
     # 服务地址配置
     websocket_service_url: str = Field(default="http://127.0.0.1:8001")
 
@@ -68,23 +85,33 @@ class BaseConfig(BaseSettings):
     # 通过环境变量 BACKUP_DIR 配置，禁止写死 localhost / 绝对路径
     backup_dir: str = Field(default="backups", alias="BACKUP_DIR")
 
+    # 滑块验证 - 真实鼠标模式开关
+    # 开启后：用 pyautogui 驱动“物理光标”回放真人轨迹完成滑块（成功率高，但会占用桌面鼠标，
+    #         仅适用于有图形桌面的 Windows 环境；运行期间该桌面鼠标被接管约 2~3 秒）。
+    # 关闭（默认）：走原有 Playwright(CDP) 轨迹 + DrissionPage 兜底逻辑。
+    # Docker / 无头 Linux 环境必须保持关闭（无桌面无法驱动物理鼠标），故默认 False。
+    captcha_real_mouse_enabled: bool = Field(default=False, alias="CAPTCHA_REAL_MOUSE")
+
     @property
     def database_url(self) -> str:
         """同步数据库连接URL"""
         password = quote_plus(self.mysql_password)
-        return f"{self.sync_driver}://{self.mysql_user}:{password}@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
+        host = f"[{self.mysql_host}]" if ":" in self.mysql_host else self.mysql_host
+        return f"{self.sync_driver}://{self.mysql_user}:{password}@{host}:{self.mysql_port}/{self.mysql_database}"
 
     @property
     def async_database_url(self) -> str:
         """异步数据库连接URL"""
         password = quote_plus(self.mysql_password)
-        return f"{self.async_driver}://{self.mysql_user}:{password}@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
-    
+        host = f"[{self.mysql_host}]" if ":" in self.mysql_host else self.mysql_host
+        return f"{self.async_driver}://{self.mysql_user}:{password}@{host}:{self.mysql_port}/{self.mysql_database}"
+
     @property
     def redis_url(self) -> str:
         """Redis连接URL"""
         password = quote_plus(self.redis_password)
-        return f"redis://:{password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+        host = f"[{self.redis_host}]" if ":" in self.redis_host else self.redis_host
+        return f"redis://:{password}@{host}:{self.redis_port}/{self.redis_db}"
 
 
 @lru_cache
